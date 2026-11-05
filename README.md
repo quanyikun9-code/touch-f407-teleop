@@ -9,6 +9,7 @@
 
 | 文件 | 作用 |
 |---|---|
+| `STARTUP.txt` | **每次启动的完整操作说明**（接线、检查、干跑、正式运行、故障判断），给第一次用的人 |
 | `pc/bridge.py` | 主手 → F407 桥接。按钮 1 只控 M1（主手 Z），按钮 2 只控 M2（绕 Y 转角），M3 只由板子屏幕控制；默认干跑，`--live` 才发指令 |
 | `pc/analyze_master.py` | 采集 CSV 体检：速率、噪声、跳变、按键、量程 |
 | `pc/touch_probe.cpp` | C++ 只读采集器（备用，需要 MSVC + OpenHaptics SDK） |
