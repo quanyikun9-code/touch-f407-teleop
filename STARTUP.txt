@@ -6,7 +6,7 @@
 所有命令都在“命令行”里输入，输完一行按一次回车。
 
 项目文件夹：
-  E:\master manipulator\主从协同逐步调试（未完善）
+  E:\master manipulator\主从协同逐步调试
 如果项目放在别的位置，把下面所有路径换成你实际的位置。
 
 
@@ -38,7 +38,7 @@
 
 在黑窗口里输入下面这行（复制粘贴也行），回车：
 
-cd /d "E:\master manipulator\主从协同逐步调试（未完善）"
+cd /d "E:\master manipulator\主从协同逐步调试"
 
 说明：cd 是“进入文件夹”，/d 表示允许换盘符。
 后面的路径必须用英文双引号包起来，因为路径里有空格和中文。
@@ -125,7 +125,7 @@ python pc\bridge.py --live
 ----------------------------------------------------------------------
 
 进入项目文件夹：
-  cd /d "E:\master manipulator\主从协同逐步调试（未完善）"
+  cd /d "E:\master manipulator\主从协同逐步调试"
 
 检查主手：
   python tools\3dtouch\code\touchpy\check_device.py
