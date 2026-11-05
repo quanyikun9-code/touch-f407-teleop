@@ -1,7 +1,9 @@
-# 采集数据 / 上位机脚本
+# 采集数据 / 上位机脚本 / 固件
 
-本目录是主从调试的上位机侧，配套固件仓库：
-**https://github.com/quanyikun9-code/STM32F407-**（串口协议见该仓库 `docs/serial_protocol.md`）。
+本目录是主从调试的上位机侧 + 固件快照。
+固件的原始仓库仍保留在 **https://github.com/quanyikun9-code/STM32F407-**，
+本仓库里的 `firmware/` 是**加了串口遥控层之后的完整工程快照**，可以直接用 Keil 打开
+`firmware/Project/Fire_F407ZG.uvprojx` 编译。
 
 ## 目录
 
@@ -11,6 +13,9 @@
 | `pc/analyze_master.py` | 采集 CSV 体检：速率、噪声、跳变、按键、量程 |
 | `pc/touch_probe.cpp` | C++ 只读采集器（备用，需要 MSVC + OpenHaptics SDK） |
 | `pc/README.md` | 环境、采集、桥接、踩坑的速查 |
+| `firmware/` | STM32F407 固件工程快照（串口遥控层 + 屏幕 6 键） |
+| `firmware/docs/serial_protocol.md` | 串口协议（命令、看门狗、控制权） |
+| `firmware/docs/wiring.md` | 三电机接线说明 |
 | `主从协同实现指南_Touch到三轴机台.md` | 从接线到验收的完整落地指南 |
 
 ## 快速开始

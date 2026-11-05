@@ -1,0 +1,17 @@
+# Keil 编译产物
+Project/Output/
+Project/Listings/
+Project/Objects/
+*.uvguix.*
+*.uvprojx.bak
+*.hex
+*.axf
+*.elf
+*.map
+*.o
+*.d
+*.crf
+*.lnp
+Debug/
+Release/
+build/
