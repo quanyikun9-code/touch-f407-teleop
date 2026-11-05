@@ -1,0 +1,4 @@
+pyserial>=3.5
+
+# analyze_master.py --plot 才需要
+matplotlib>=3.6

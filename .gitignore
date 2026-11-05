@@ -1,0 +1,15 @@
+# 上游 3dtouch：包含 394 MB 驱动/SDK 安装包，且 SDK 授权禁止再分发
+tools/
+
+# 采集数据
+captures/
+
+# 一次性草稿脚本
+_read_docx.py
+_fix_section0.py
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.log
