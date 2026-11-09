@@ -13,6 +13,9 @@
 | `pc/bridge.py` | 主手 → F407 桥接。按钮 1 只控 M1（主手 Z），按钮 2 只控 M2（绕 Y 转角），M3 只由板子屏幕控制；默认干跑，`--live` 才发指令 |
 | `pc/analyze_master.py` | 采集 CSV 体检：速率、噪声、跳变、按键、量程 |
 | `pc/touch_probe.cpp` | C++ 只读采集器（备用，需要 MSVC + OpenHaptics SDK） |
+| `pc/sensor_log.py` | 读 PC7 光电传感器：遮挡状态 + 边沿计数 + 周期，可存 CSV |
+| `pc/serial_console.py` | 最小串口助手（自动处理 CH340 的 DTR/RTS 复位），交互式或 `--cmd` 单发 |
+| `pc/limit_test.py` | M1 限位测距：走到光电触发 → 记脉冲 → 原路退回，报圈数/角度/毫米 |
 | `pc/README.md` | 环境、采集、桥接、踩坑的速查 |
 | `firmware/` | STM32F407 固件工程快照（串口遥控层 + 屏幕 6 键） |
 | `firmware/docs/serial_protocol.md` | 串口协议（命令、看门狗、控制权） |

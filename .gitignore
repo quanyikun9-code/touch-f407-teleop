@@ -13,3 +13,6 @@ __pycache__/
 *.py[cod]
 .venv/
 *.log
+
+# Keil 自动生成的调试配置
+firmware/Project/DebugConfig/

@@ -38,7 +38,35 @@
 
 #define MOTOR_COUNT                 3U
 #define MOTOR_TIMER_TICK_HZ         20000U
-#define MOTOR1_CONTINUOUS_SPEED_HZ  1600U
+/*
+ * Screen buttons for M1 run at 4800 Hz (3x the original 1600 Hz): 4800/3200 =
+ * 1.5 rev/s = 90 rpm. There is no acceleration ramp, so a loaded mechanism may
+ * stall or lose steps at this speed - lower it here if it does. Note that this
+ * value is also the default rate for a bare "M1 FWD" over serial; the bridge
+ * always sends an explicit Hz, so its --max-hz1 is unaffected.
+ */
+#define MOTOR1_CONTINUOUS_SPEED_HZ  4800U
+
+/*
+ * Fixed return travel, in pulses. This is the distance measured on the machine
+ * (limit_test: POS = 129776 when the photoelectric sensor triggered), i.e. the
+ * gap between the initial position and the limit. 回位 always moves exactly
+ * this many pulses backwards, no matter what the counter currently reads.
+ */
+#define MOTOR1_HOME_PULSES          129776L
+
+/*
+ * Speed of the on-screen "return to zero" move: 4800 Hz, about 27 s for the
+ * 129776-pulse travel.
+ */
+#define MOTOR1_RETURN_SPEED_HZ      4800U
+
+/*
+ * Acceleration ramp, in Hz added per 20 kHz tick. 1 Hz/tick = 20000 Hz/s, so
+ * 1600 Hz is reached in 80 ms and 4800 Hz in 240 ms. Without this the driver
+ * jumps straight to the target rate and a loaded stepper stalls.
+ */
+#define MOTOR_RAMP_HZ_PER_TICK      1U
 #define MOTOR_CONTINUOUS_SPEED_HZ   400U
 
 /*
@@ -78,6 +106,50 @@
 #define MOTOR3_DIR_PIN              GPIO_PIN_5
 #define MOTOR_GPIO_PORT             GPIOC
 
+/*
+ * Photoelectric sensor (beam / limit switch) on PC7.
+ *
+ * NPN open-collector output: the transistor pulls the line low while the beam
+ * is blocked, so the input gets a pull-up and PHOTO_ACTIVE_LOW stays 1.
+ * Sampling runs inside the 20 kHz TIM6 tick, decimated by PHOTO_SAMPLE_DIVIDER
+ * to PHOTO_SAMPLE_HZ, so edges are still caught while the main loop spends
+ * tens of milliseconds repainting the LCD.
+ *
+ * Electrical check before trusting the readings: with the sensor powered,
+ * measure PC7 to GND in both beam states. It must never exceed 3.3 V (PC7 is
+ * 5 V tolerant, not 24 V tolerant), and the sensor supply ground must be
+ * common with the board GND. If the internal ~40k pull-up is too weak for the
+ * cable, add an external 4.7k-10k pull-up from PC7 to 3.3 V.
+ *
+ * Note: on the F407 PC7 is also SDIO_D7. This project never enables SDIO, so
+ * using it as a plain GPIO input is safe.
+ */
+#define PHOTO_GPIO_PORT             GPIOC
+#define PHOTO_GPIO_PIN              GPIO_PIN_7
+#define PHOTO_ACTIVE_LOW            1U
+#define PHOTO_SAMPLE_DIVIDER        20U     /* 20 kHz tick / 20 = 1 kHz sampling */
+#define PHOTO_SAMPLE_HZ             (MOTOR_TIMER_TICK_HZ / PHOTO_SAMPLE_DIVIDER)
+#define PHOTO_SAMPLE_US             (1000000U / PHOTO_SAMPLE_HZ)
+#define PHOTO_DEBOUNCE_SAMPLES      3U      /* accept a level after 3 stable samples */
+
+/*
+ * Alert while the beam is blocked: blink the red LED and/or sound the buzzer.
+ * PHOTO_ALERT_MODE is a bit mask - 1 = red LED, 2 = buzzer, 3 = both, 0 = off.
+ * The blink is driven from the same 1 kHz sample tick, so a slow LCD repaint
+ * cannot make it stutter, and it costs a couple of GPIO writes per half period
+ * (nothing at all while the beam is free).
+ *
+ * While alerting, the normal green LED is switched off so the blink reads as
+ * red/off instead of red/green. A diagnostic build (LCD_DIAGNOSTIC_MODE or
+ * UI_STAGED_DIAGNOSTIC) sets its own LED colours and will be overridden here.
+ */
+#define PHOTO_ALERT_MODE            3U
+#define PHOTO_ALERT_HZ              4U      /* blink / beep cycles per second */
+
+#if (PHOTO_ALERT_MODE != 0U) && (PHOTO_ALERT_HZ == 0U)
+#error "PHOTO_ALERT_HZ must be greater than 0"
+#endif
+
 typedef enum
 {
     MOTOR_DIR_CCW = 0,
@@ -102,6 +174,7 @@ typedef struct
     volatile uint8_t step_high;
     volatile uint8_t direction;
     volatile int32_t position;      /* signed pulse count, + = MOTOR_DIR_CW command */
+    volatile uint32_t speed_now_hz;  /* ramped rate; pulse_frequency_hz is the target */
 } Motor_t;
 
 typedef struct
@@ -133,6 +206,15 @@ static void UI_ProcessTouch(void);
 static uint8_t UI_PointInButton(uint16_t x, uint16_t y, const Button_t *button);
 static void UI_DrawGlyph(uint16_t x, uint16_t y, uint8_t glyph_index, uint16_t background);
 static void UI_DrawButton(const Button_t *button, uint16_t color);
+static uint8_t UI_M1ReturnEnabled(void);
+static void Photo_GPIO_Config(void);
+static uint8_t Photo_IsActive(uint8_t raw);
+static void Photo_SampleTick(void);
+static void Photo_Snapshot(uint8_t *level, uint8_t *raw, uint32_t *edges,
+                           uint32_t *edge_ms, uint32_t *period_us);
+static void Photo_AlertTick(void);
+static void Photo_AlertSet(uint8_t on);
+static void Photo_AlertRestore(void);
 
 TIM_HandleTypeDef htim6;
 
@@ -143,14 +225,20 @@ static Motor_t motors[MOTOR_COUNT] =
     {MOTOR3_STEP_PIN, MOTOR3_DIR_PIN, 0U, 0U, 0U, 0U, 0U, MOTOR_DIR_CW, 0}
 };
 
-static Button_t buttons[6] =
+static Button_t buttons[7] =
 {
     {20U, 100U, 210U, 145U, {0U, 1U, 2U, 3U}, 4U},        /* 直线推进: M1 CW, hold */
     {250U, 100U, 210U, 145U, {0U, 1U, 4U, 5U}, 4U},       /* 直线回退: M1 CCW, hold */
     {20U, 295U, 210U, 145U, {6U, 7U, 8U, 9U, 10U}, 5U},   /* 顺时针旋转: M2 CW, hold */
     {250U, 295U, 210U, 145U, {11U, 7U, 8U, 9U, 10U}, 5U}, /* 逆时针旋转: M2 CCW, hold */
     {20U, 490U, 210U, 145U, {12U, 13U, 12U, 14U}, 4U},    /* Clamp: M3 CW, 65 x 45 degrees */
-    {250U, 490U, 210U, 145U, {12U, 13U, 15U, 16U}, 4U}   /* Open: M3 CCW, 65 x 45 degrees */
+    {250U, 490U, 210U, 145U, {12U, 13U, 15U, 16U}, 4U},   /* Open: M3 CCW, 65 x 45 degrees */
+    /*
+     * 回位 (glyph 4 = 回, glyph 17 = 位). Sits in the free strip between the
+     * title and the first row. Gray until the photoelectric sensor has counted
+     * a new edge, i.e. until the axis has actually reached the limit.
+     */
+    {270U, 56U, 180U, 40U, {4U, 17U}, 2U}
 };
 
 static uint8_t ui_m3_button_was_down;
@@ -172,8 +260,35 @@ static uint8_t ui_raw_valid;
 static volatile uint8_t remote_active;
 static volatile uint32_t remote_last_cmd_ms;
 static uint8_t ui_last_remote;
+
+/*
+ * M1 "回位" button. m1_return_pending is read from the 20 kHz tick (to keep the
+ * 300 ms "no touch -> stop" guard from killing an automatic return), hence the
+ * volatile. m1_return_edges records the sensor count at the last return, so the
+ * button greys out again until the axis reaches the limit once more.
+ */
+static volatile uint8_t m1_return_pending;
+static uint32_t m1_return_edges;
+static uint8_t ui_last_return_ready;
+static uint32_t ui_last_pos_ms;
 static int32_t axis_min[MOTOR_COUNT] = {INT32_MIN, INT32_MIN, INT32_MIN};
 static int32_t axis_max[MOTOR_COUNT] = {INT32_MAX, INT32_MAX, INT32_MAX};
+
+/* Photoelectric sensor state; written from the TIM6 tick, read by SENSOR. */
+static volatile uint8_t  photo_level;        /* debounced: 1 = beam blocked */
+static volatile uint8_t  photo_raw;          /* last raw pin level, for diagnostics */
+static volatile uint32_t photo_edges;        /* blocked edges since boot/reset */
+static volatile uint32_t photo_edge_ms;      /* HAL_GetTick() at the last edge */
+static volatile uint32_t photo_period_us;    /* interval from the previous edge */
+static volatile uint32_t photo_sample_index; /* 1 kHz sample counter */
+static volatile uint32_t photo_edge_sample;  /* sample index at the last edge */
+static volatile uint8_t  photo_has_edge;
+static uint16_t photo_divider;
+static uint8_t  photo_candidate;
+static uint8_t  photo_same;
+static volatile uint8_t photo_alert_on;
+static uint8_t  photo_alert_started;
+static uint16_t photo_alert_div;
 
 /**
   * @brief  主函数
@@ -211,6 +326,10 @@ int main(void)
             Motor_GPIO_Config();
         }
     }
+
+    /* 光电传感器（PC7）。采样在 TIM6 中断里做，这里只配引脚。 */
+    BEEP_GPIO_Config();     /* PG7，遮挡提示用 */
+    Photo_GPIO_Config();
 
     printf("欢迎使用野火开发板 \r\n");
     printf("三电机触摸控制程序启动 \r\n");
@@ -250,7 +369,7 @@ int main(void)
         LED_RGBOFF;
         LED_GREEN;
         lcd_fill_color(0U, 0U, LCD_X_LENGTH, LCD_Y_LENGTH, BLACK);
-        for (button_index = 0U; button_index < 6U; button_index++)
+        for (button_index = 0U; button_index < 7U; button_index++)
         {
             lcd_fill_color(buttons[button_index].x, buttons[button_index].y,
                            buttons[button_index].width, buttons[button_index].height, BLUE);
@@ -322,6 +441,24 @@ int main(void)
         }
 
         /* The timer creates pulses. The main loop only handles touch and UI. */
+        if ((m1_return_pending != 0U) && (motors[0].running == 0U))
+        {
+            /* The return move ran out of pulses: disarm 回位 until the next edge. */
+            m1_return_pending = 0U;
+            m1_return_edges = photo_edges;
+        }
+
+        /* Keep the M1 pulse count live (2 Hz) so a truncated move is obvious. */
+        if ((uint32_t)(HAL_GetTick() - ui_last_pos_ms) >= 500U)
+        {
+            char pos_text[24];
+
+            ui_last_pos_ms = HAL_GetTick();
+            sprintf(pos_text, "M1:%ld    ", (long)motors[0].position);
+            lcd_fill_color(366U, 24U, 114U, 26U, BLACK);
+            LCD_DispString_EN(366U, 26U, pos_text, WHITE, BLACK, &Font8x16);
+        }
+
         if ((ui_last_state[0] != motors[0].running) ||
             (ui_last_state[1] != motors[1].running) ||
             (ui_last_state[2] != motors[2].running) ||
@@ -331,6 +468,7 @@ int main(void)
             (ui_last_m3_next_action != (uint8_t)m3_next_action) ||
             (ui_last_clamp_count != m3_clamp_count) ||
             (ui_last_open_count != m3_open_count) ||
+            (ui_last_return_ready != UI_M1ReturnEnabled()) ||
             (ui_last_remote != remote_active))
         {
             UI_Draw();
@@ -359,6 +497,186 @@ static void Motor_GPIO_Config(void)
 
     HAL_GPIO_WritePin(MOTOR_GPIO_PORT, GPIO_InitStruct.Pin, GPIO_PIN_RESET);
 }
+
+static uint8_t Photo_IsActive(uint8_t raw)
+{
+#if (PHOTO_ACTIVE_LOW != 0U)
+    return (raw == 0U) ? 1U : 0U;
+#else
+    return (raw != 0U) ? 1U : 0U;
+#endif
+}
+
+static void Photo_GPIO_Config(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = PHOTO_GPIO_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+#if (PHOTO_ACTIVE_LOW != 0U)
+    GPIO_InitStruct.Pull = GPIO_PULLUP;     /* NPN open collector needs a pull-up */
+#else
+    GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+#endif
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(PHOTO_GPIO_PORT, &GPIO_InitStruct);
+
+    photo_raw = (HAL_GPIO_ReadPin(PHOTO_GPIO_PORT, PHOTO_GPIO_PIN) == GPIO_PIN_SET) ? 1U : 0U;
+    photo_level = Photo_IsActive(photo_raw);
+    photo_candidate = photo_level;
+    photo_same = 0U;
+    photo_divider = 0U;
+    photo_edges = 0U;
+    photo_edge_ms = 0U;
+    photo_period_us = 0U;
+    photo_sample_index = 0U;
+    photo_edge_sample = 0U;
+    photo_has_edge = 0U;
+}
+
+/*
+ * Runs from the 20 kHz TIM6 tick, so it does not care how long UI_Draw takes.
+ * A level is committed only after PHOTO_DEBOUNCE_SAMPLES identical samples
+ * (3 ms by default); EDGES counts the blocked transitions only.
+ */
+static void Photo_SampleTick(void)
+{
+    uint8_t raw;
+    uint8_t active;
+
+    if ((uint32_t)(photo_divider + 1U) < (uint32_t)PHOTO_SAMPLE_DIVIDER)
+    {
+        photo_divider++;
+        return;
+    }
+    photo_divider = 0U;
+    photo_sample_index++;
+
+    /* Uses the level committed on the previous sample: one 1 ms tick of lag. */
+    Photo_AlertTick();
+
+    raw = (HAL_GPIO_ReadPin(PHOTO_GPIO_PORT, PHOTO_GPIO_PIN) == GPIO_PIN_SET) ? 1U : 0U;
+    photo_raw = raw;
+    active = Photo_IsActive(raw);
+
+    if (active != photo_candidate)
+    {
+        photo_candidate = active;
+        photo_same = 1U;
+        return;
+    }
+    if ((uint32_t)photo_same < (uint32_t)PHOTO_DEBOUNCE_SAMPLES)
+    {
+        photo_same++;
+        return;
+    }
+    if (active == photo_level)
+    {
+        return;
+    }
+
+    photo_level = active;
+    if (active != 0U)
+    {
+        photo_edges++;
+        if (photo_has_edge != 0U)
+        {
+            photo_period_us = (uint32_t)(photo_sample_index - photo_edge_sample) * PHOTO_SAMPLE_US;
+        }
+        photo_edge_sample = photo_sample_index;
+        photo_edge_ms = HAL_GetTick();
+        photo_has_edge = 1U;
+    }
+}
+
+/* Copy the live values with the tick masked, so no uint32 read can tear. */
+static void Photo_Snapshot(uint8_t *level, uint8_t *raw, uint32_t *edges,
+                           uint32_t *edge_ms, uint32_t *period_us)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    *level = photo_level;
+    *raw = photo_raw;
+    *edges = photo_edges;
+    *edge_ms = photo_edge_ms;
+    *period_us = photo_period_us;
+    __set_PRIMASK(primask);
+}
+
+#if (PHOTO_ALERT_MODE != 0U)
+static void Photo_AlertSet(uint8_t on)
+{
+#if (PHOTO_ALERT_MODE & 2U)
+    HAL_GPIO_WritePin(BEEP_GPIO_PORT, BEEP_PIN,
+                      (on != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+#endif
+#if (PHOTO_ALERT_MODE & 1U)
+    /* Red LED is active low; hide the normal green so the blink reads red/off. */
+    HAL_GPIO_WritePin(LED1_GPIO_PORT, LED1_PIN,
+                      (on != 0U) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LED2_GPIO_PORT, LED2_PIN, GPIO_PIN_SET);
+#endif
+}
+
+static void Photo_AlertRestore(void)
+{
+#if (PHOTO_ALERT_MODE & 2U)
+    HAL_GPIO_WritePin(BEEP_GPIO_PORT, BEEP_PIN, GPIO_PIN_RESET);
+#endif
+#if (PHOTO_ALERT_MODE & 1U)
+    HAL_GPIO_WritePin(LED1_GPIO_PORT, LED1_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LED2_GPIO_PORT, LED2_PIN, GPIO_PIN_RESET);   /* back to LED_GREEN */
+#endif
+}
+
+/* Runs once per 1 ms sample: blocked -> toggle at PHOTO_ALERT_HZ. */
+static void Photo_AlertTick(void)
+{
+    uint16_t half = (uint16_t)(PHOTO_SAMPLE_HZ / (2U * PHOTO_ALERT_HZ));
+
+    if (half == 0U)
+    {
+        half = 1U;
+    }
+
+    if (photo_level == 0U)
+    {
+        if (photo_alert_started != 0U)
+        {
+            photo_alert_started = 0U;
+            photo_alert_on = 0U;
+            photo_alert_div = 0U;
+            Photo_AlertRestore();
+        }
+        return;
+    }
+
+    if (photo_alert_started == 0U)
+    {
+        /* Start with the LED/buzzer on so the first blocked millisecond is visible. */
+        photo_alert_started = 1U;
+        photo_alert_on = 1U;
+        photo_alert_div = 0U;
+        Photo_AlertSet(1U);
+        return;
+    }
+
+    if (++photo_alert_div < half)
+    {
+        return;
+    }
+    photo_alert_div = 0U;
+    photo_alert_on ^= 1U;
+    Photo_AlertSet(photo_alert_on);
+}
+#else
+static void Photo_AlertTick(void)
+{
+}
+#endif
 
 static void Isolator_StaticTest_Config(void)
 {
@@ -455,6 +773,7 @@ static uint8_t Motor_StartContinuousHz(uint8_t motor_index, MotorDirection_t dir
     }
     motor->direction = direction;
     motor->phase_accumulator = 0U;
+    motor->speed_now_hz = 0U;
     motor->pulses_remaining = 0U;
     motor->pulse_frequency_hz = hz;
     motor->running = 1U;
@@ -503,6 +822,7 @@ static uint8_t Motor_StartMove(uint8_t motor_index, int32_t pulses, uint32_t hz)
     }
     motor->direction = direction;
     motor->phase_accumulator = 0U;
+    motor->speed_now_hz = 0U;
     motor->pulses_remaining = magnitude;
     motor->pulse_frequency_hz = hz;
     motor->running = 1U;
@@ -543,6 +863,7 @@ static uint8_t Motor_StartFixedMove(MotorDirection_t direction)
     }
     motor->direction = direction;
     motor->phase_accumulator = 0U;
+    motor->speed_now_hz = 0U;
     motor->pulses_remaining = MOTOR3_TRAVEL_PULSES;
     motor->pulse_frequency_hz = MOTOR3_SPEED_HZ;
     motor->running = 1U;
@@ -564,7 +885,8 @@ static void Motor_Service(void)
             remote_active = 0U;
         }
     }
-    else if ((uint32_t)(HAL_GetTick() - ui_last_touch_report_ms) > TOUCH_REPORT_TIMEOUT_MS)
+    else if ((m1_return_pending == 0U) &&
+             ((uint32_t)(HAL_GetTick() - ui_last_touch_report_ms) > TOUCH_REPORT_TIMEOUT_MS))
     {
         motors[0].running = 0U;
         motors[1].running = 0U;
@@ -593,7 +915,25 @@ static void Motor_Service(void)
             continue;
         }
 
-        motor->phase_accumulator += motor->pulse_frequency_hz;
+        /* Ramp towards the commanded rate instead of jumping straight to it. */
+        if (motor->speed_now_hz < motor->pulse_frequency_hz)
+        {
+            motor->speed_now_hz += MOTOR_RAMP_HZ_PER_TICK;
+            if (motor->speed_now_hz > motor->pulse_frequency_hz)
+            {
+                motor->speed_now_hz = motor->pulse_frequency_hz;
+            }
+        }
+        else if (motor->speed_now_hz > motor->pulse_frequency_hz)
+        {
+            motor->speed_now_hz -= MOTOR_RAMP_HZ_PER_TICK;
+            if (motor->speed_now_hz < motor->pulse_frequency_hz)
+            {
+                motor->speed_now_hz = motor->pulse_frequency_hz;
+            }
+        }
+
+        motor->phase_accumulator += motor->speed_now_hz;
         if (motor->phase_accumulator >= MOTOR_TIMER_TICK_HZ)
         {
             motor->phase_accumulator -= MOTOR_TIMER_TICK_HZ;
@@ -623,6 +963,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (htim->Instance == TIM6)
     {
         Motor_Service();
+        Photo_SampleTick();
     }
 }
 
@@ -686,6 +1027,20 @@ static void UI_DrawRawTouch(void)
     LCD_DispString_EN(20U, 760U, position_text, CYAN, BLACK, &Font16x24);
 }
 
+/* 回位 is armed only while the sensor has produced an edge since the last return. */
+static uint8_t UI_M1ReturnEnabled(void)
+{
+    /*
+     * A "SENSOR RESET" from the PC clears photo_edges. Without this the stored
+     * baseline would stay above the counter and the button would never arm again.
+     */
+    if (photo_edges < m1_return_edges)
+    {
+        m1_return_edges = photo_edges;
+    }
+    return (photo_edges > m1_return_edges) ? 1U : 0U;
+}
+
 static void UI_Draw(void)
 {
     char status_text[48];
@@ -693,6 +1048,10 @@ static void UI_Draw(void)
 
     lcd_fill_color(0U, 0U, LCD_X_LENGTH, LCD_Y_LENGTH, BLACK);
     LCD_DispString_EN(20U, 25U, "STEPPER MOTOR CONTROL", YELLOW, BLACK, &Font16x24);
+
+    /* Live M1 pulse count: the same reference the 回位 button returns to. */
+    sprintf(count_text, "M1:%ld", (long)motors[0].position);
+    LCD_DispString_EN(366U, 26U, count_text, WHITE, BLACK, &Font8x16);
 
     UI_DrawButton(&buttons[0], (motors[0].running != 0U && motors[0].direction == MOTOR_DIR_CW) ? GREEN : BLUE);
     UI_DrawButton(&buttons[1], (motors[0].running != 0U && motors[0].direction == MOTOR_DIR_CCW) ? GREEN : BLUE);
@@ -704,6 +1063,9 @@ static void UI_Draw(void)
     UI_DrawButton(&buttons[5],
                   (motors[2].running != 0U && motors[2].direction == MOTOR_DIR_CCW) ? GREEN :
                   (motors[2].running != 0U || m3_next_action == M3_ALLOW_CLAMP) ? GRAY : BLUE);
+    UI_DrawButton(&buttons[6],
+                  (m1_return_pending != 0U) ? GREEN :
+                  (UI_M1ReturnEnabled() != 0U) ? YELLOW : GRAY);
 
     /* Counts are accepted commands, not measured position or clamp force. */
     sprintf(count_text, "CLAMP:%lu  OPEN:%lu",
@@ -746,6 +1108,7 @@ static void UI_Draw(void)
     ui_last_m3_next_action = (uint8_t)m3_next_action;
     ui_last_clamp_count = m3_clamp_count;
     ui_last_open_count = m3_open_count;
+    ui_last_return_ready = UI_M1ReturnEnabled();
     ui_last_remote = remote_active;
 }
 
@@ -754,6 +1117,7 @@ static void UI_ProcessTouch(void)
     uint8_t m1_command = 0U;
     uint8_t m2_command = 0U;
     uint8_t m3_command = 0U;
+    uint8_t m1_return_command = 0U;
     uint8_t touch_result = 3U;
     uint8_t point_index;
     uint16_t screen_x;
@@ -808,6 +1172,8 @@ static void UI_ProcessTouch(void)
             m3_command = 1U;
         else if (UI_PointInButton(screen_x, screen_y, &buttons[5]) != 0U)
             m3_command = 2U;
+        else if (UI_PointInButton(screen_x, screen_y, &buttons[6]) != 0U)
+            m1_return_command = 1U;
     }
 
     /*
@@ -817,7 +1183,7 @@ static void UI_ProcessTouch(void)
      */
     if (remote_active != 0U)
     {
-        if ((m1_command | m2_command | m3_command) != 0U)
+        if ((m1_command | m2_command | m3_command | m1_return_command) != 0U)
         {
             remote_active = 0U;
         }
@@ -827,11 +1193,34 @@ static void UI_ProcessTouch(void)
         }
     }
 
+    /*
+     * 回位: only when M1 is idle and the sensor has counted a new edge.
+     * The move is always the measured initial->limit distance, not "whatever
+     * the counter reads now", so one press always brings the axis all the way
+     * back even if the position reference was reset by a board restart.
+     */
+    if (m1_return_command != 0U)
+    {
+        if ((m1_return_pending == 0U) && (motors[0].running == 0U) &&
+            (UI_M1ReturnEnabled() != 0U))
+        {
+            (void)Motor_StartMove(0U, -(int32_t)MOTOR1_HOME_PULSES,
+                                  MOTOR1_RETURN_SPEED_HZ);
+            m1_return_pending = 1U;
+        }
+    }
+
+    if (m1_command != 0U)
+    {
+        /* A hand command always wins over an automatic return. */
+        m1_return_pending = 0U;
+    }
+
     if (m1_command == 1U)
         Motor_StartContinuous(0U, MOTOR_DIR_CW);
     else if (m1_command == 2U)
         Motor_StartContinuous(0U, MOTOR_DIR_CCW);
-    else
+    else if (m1_return_pending == 0U)
         Motor_Stop(0U);
 
     if (ACTIVE_MOTOR_COUNT >= 2U)
@@ -944,11 +1333,62 @@ static void Remote_Execute(char *line)
         return;
     }
 
+    /*
+     * SENSOR is a pure read. Handle it before the watchdog refresh: a sensor
+     * logger left polling after the bridge dies must not keep M1/M2 running.
+     */
+    if (strcmp(argv[0], "SENSOR") == 0)
+    {
+        uint8_t level;
+        uint8_t raw;
+        uint32_t edges;
+        uint32_t edge_ms;
+        uint32_t period_us;
+
+        if ((argc > 1U) && (strcmp(argv[1], "RESET") == 0))
+        {
+            uint32_t primask = __get_PRIMASK();
+
+            __disable_irq();
+            photo_edges = 0U;
+            photo_has_edge = 0U;
+            photo_period_us = 0U;
+            __set_PRIMASK(primask);
+            printf("OK SENSOR RESET\r\n");
+            return;
+        }
+
+        Photo_Snapshot(&level, &raw, &edges, &edge_ms, &period_us);
+        printf("OK SENSOR=%u RAW=%u EDGES=%lu MS=%lu PERIOD=%lu\r\n",
+               (unsigned)level, (unsigned)raw, (unsigned long)edges,
+               (unsigned long)edge_ms, (unsigned long)period_us);
+        return;
+    }
+
     remote_last_cmd_ms = HAL_GetTick();
 
     if (strcmp(argv[0], "PING") == 0)
     {
         printf("OK PONG\r\n");
+        return;
+    }
+
+    if (strcmp(argv[0], "BEEP") == 0)
+    {
+        int32_t ms = Remote_ToLong((argc > 1U) ? argv[1] : NULL, 200);
+
+        if (ms < 1)
+        {
+            ms = 1;
+        }
+        if (ms > 5000)
+        {
+            ms = 5000;
+        }
+        HAL_GPIO_WritePin(BEEP_GPIO_PORT, BEEP_PIN, GPIO_PIN_SET);
+        HAL_Delay((uint32_t)ms);
+        HAL_GPIO_WritePin(BEEP_GPIO_PORT, BEEP_PIN, GPIO_PIN_RESET);
+        printf("OK BEEP %ld\r\n", (long)ms);
         return;
     }
 
@@ -1134,26 +1574,39 @@ static void Remote_Execute(char *line)
 
 static void Remote_Service(void)
 {
-    uint8_t *data;
+    char frame[U1_BUFFER_MAX_SIZE];
     uint16_t size;
     char *line;
     char *newline;
+    uint32_t primask;
 
     if (u1_get_rx_flag() == 0U)
     {
         return;
     }
 
-    data = u1_get_rx_data();
+    /*
+     * Copy the frame out and release the RX buffer *before* printing the reply.
+     * The USART ISR drops bytes while a frame is still pending, so holding the
+     * buffer through a blocking printf() lost every command that arrived during
+     * the ~4 ms reply. With a 10 ms main loop that hit roughly every other poll,
+     * and since a lost command does not refresh the watchdog, a moving axis could
+     * be stopped by the 1.5 s remote timeout in the middle of a move.
+     */
+    primask = __get_PRIMASK();
+    __disable_irq();
     size = u1_get_rx_size();
     if (size > (U1_BUFFER_MAX_SIZE - 1U))
     {
         size = U1_BUFFER_MAX_SIZE - 1U;
     }
-    data[size] = 0;
+    memcpy(frame, u1_get_rx_data(), size);
+    frame[size] = '\0';
+    u1_clean_rx_data();
+    __set_PRIMASK(primask);
 
     /* One frame may carry more than one line; run each of them. */
-    line = (char *)data;
+    line = frame;
     while (*line != '\0')
     {
         newline = strchr(line, '\n');
@@ -1168,7 +1621,6 @@ static void Remote_Service(void)
         }
         line = newline + 1;
     }
-    u1_clean_rx_data();
 }
 
 /**
