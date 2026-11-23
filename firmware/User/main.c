@@ -23,20 +23,24 @@
 #include "control_glyphs.h"
 #include "lcd_draw.h"
 #include "lcd_touch.h"
+#include "second_instrument.h"
 
 /* M3 moves 65 calibrated 45-degree increments; clamp and open alternate. */
 #define LCD_DIAGNOSTIC_MODE         0U
 #define UI_STAGED_DIAGNOSTIC        0U
 #define MOTOR_OUTPUT_ENABLED       1U
 #define ISOLATOR_STATIC_TEST        0U
-#define ACTIVE_MOTOR_COUNT          3U
+#define ACTIVE_MOTOR_COUNT          (SECOND_INSTRUMENT_ENABLED ? 6U : 3U)
 #define TOUCH_REPORT_TIMEOUT_MS    300U
 
 /* Serial remote layer (see the project guide, section 7). */
 #define REMOTE_TIMEOUT_MS          1500U
 #define REMOTE_MAX_STEP_HZ         10000U
 
-#define MOTOR_COUNT                 3U
+#define MOTOR_COUNT                 6U
+#define INSTRUMENT_COUNT            2U
+#define BUTTON_COUNT                7U
+#define UI_GLYPH_SIZE               24U
 #define MOTOR_TIMER_TICK_HZ         20000U
 /*
  * Screen buttons for M1 run at 4800 Hz (3x the original 1600 Hz): 4800/3200 =
@@ -165,8 +169,11 @@ typedef enum
 
 typedef struct
 {
+    GPIO_TypeDef *step_port;
+    GPIO_TypeDef *dir_port;
     uint16_t step_pin;
     uint16_t dir_pin;
+    uint8_t dir_inverted;
     volatile uint32_t phase_accumulator;
     volatile uint32_t pulse_frequency_hz;
     volatile uint32_t pulses_remaining;
@@ -187,6 +194,21 @@ typedef struct
     uint8_t label_length;
 } Button_t;
 
+typedef struct
+{
+    M3NextAction_t next_action;
+    uint16_t held_clamp_ids;
+    uint32_t clamp_count;
+    uint32_t open_count;
+    volatile uint8_t return_pending;
+    uint8_t return_was_down;
+    uint32_t return_edges;
+    uint16_t last_colors[BUTTON_COUNT];
+    uint8_t last_remote;
+    uint32_t last_clamp_count;
+    uint32_t last_open_count;
+} Instrument_t;
+
 static void SystemClock_Config(void);
 void Delay( uint32_t nCount);
 static void Motor_GPIO_Config(void);
@@ -197,16 +219,18 @@ static void Motor_StartContinuous(uint8_t motor_index, MotorDirection_t directio
 static uint8_t Motor_StartContinuousHz(uint8_t motor_index, MotorDirection_t direction, uint32_t hz);
 static uint8_t Motor_StartMove(uint8_t motor_index, int32_t pulses, uint32_t hz);
 static void Motor_Stop(uint8_t motor_index);
-static uint8_t Motor_StartFixedMove(MotorDirection_t direction);
+static uint8_t Motor_StartFixedMove(uint8_t group, MotorDirection_t direction);
 static void Motor_Service(void);
 static void Remote_Service(void);
 static void Remote_Execute(char *line);
 static void UI_Draw(void);
+static void UI_Refresh(void);
 static void UI_ProcessTouch(void);
 static uint8_t UI_PointInButton(uint16_t x, uint16_t y, const Button_t *button);
 static void UI_DrawGlyph(uint16_t x, uint16_t y, uint8_t glyph_index, uint16_t background);
-static void UI_DrawButton(const Button_t *button, uint16_t color);
-static uint8_t UI_M1ReturnEnabled(void);
+static void UI_DrawButton(const Button_t *button, uint16_t top, uint16_t color);
+static uint8_t UI_ReturnEnabled(uint8_t group);
+static uint32_t UI_ReturnEdges(uint8_t group);
 static void Photo_GPIO_Config(void);
 static uint8_t Photo_IsActive(uint8_t raw);
 static void Photo_SampleTick(void);
@@ -220,59 +244,45 @@ TIM_HandleTypeDef htim6;
 
 static Motor_t motors[MOTOR_COUNT] =
 {
-    {MOTOR1_STEP_PIN, MOTOR1_DIR_PIN, 0U, 0U, 0U, 0U, 0U, MOTOR_DIR_CW, 0},
-    {MOTOR2_STEP_PIN, MOTOR2_DIR_PIN, 0U, 0U, 0U, 0U, 0U, MOTOR_DIR_CW, 0},
-    {MOTOR3_STEP_PIN, MOTOR3_DIR_PIN, 0U, 0U, 0U, 0U, 0U, MOTOR_DIR_CW, 0}
+    {MOTOR_GPIO_PORT, MOTOR_GPIO_PORT, MOTOR1_STEP_PIN, MOTOR1_DIR_PIN, MOTOR1_DIR_INVERTED},
+    {MOTOR_GPIO_PORT, MOTOR_GPIO_PORT, MOTOR2_STEP_PIN, MOTOR2_DIR_PIN, MOTOR2_DIR_INVERTED},
+    {MOTOR_GPIO_PORT, MOTOR_GPIO_PORT, MOTOR3_STEP_PIN, MOTOR3_DIR_PIN, MOTOR3_DIR_INVERTED},
+    {MOTOR4_STEP_PORT, MOTOR4_DIR_PORT, MOTOR4_STEP_PIN, MOTOR4_DIR_PIN, MOTOR4_DIR_INVERTED},
+    {MOTOR5_STEP_PORT, MOTOR5_DIR_PORT, MOTOR5_STEP_PIN, MOTOR5_DIR_PIN, MOTOR5_DIR_INVERTED},
+    {MOTOR6_STEP_PORT, MOTOR6_DIR_PORT, MOTOR6_STEP_PIN, MOTOR6_DIR_PIN, MOTOR6_DIR_INVERTED}
 };
 
-static Button_t buttons[7] =
+/* Coordinates are relative to the top of each half of the LCD. */
+static const Button_t buttons[BUTTON_COUNT] =
 {
-    {20U, 100U, 210U, 145U, {0U, 1U, 2U, 3U}, 4U},        /* 直线推进: M1 CW, hold */
-    {250U, 100U, 210U, 145U, {0U, 1U, 4U, 5U}, 4U},       /* 直线回退: M1 CCW, hold */
-    {20U, 295U, 210U, 145U, {6U, 7U, 8U, 9U, 10U}, 5U},   /* 顺时针旋转: M2 CW, hold */
-    {250U, 295U, 210U, 145U, {11U, 7U, 8U, 9U, 10U}, 5U}, /* 逆时针旋转: M2 CCW, hold */
-    {20U, 490U, 210U, 145U, {12U, 13U, 12U, 14U}, 4U},    /* Clamp: M3 CW, 65 x 45 degrees */
-    {250U, 490U, 210U, 145U, {12U, 13U, 15U, 16U}, 4U},   /* Open: M3 CCW, 65 x 45 degrees */
-    /*
-     * 回位 (glyph 4 = 回, glyph 17 = 位). Sits in the free strip between the
-     * title and the first row. Gray until the photoelectric sensor has counted
-     * a new edge, i.e. until the axis has actually reached the limit.
-     */
-    {270U, 56U, 180U, 40U, {4U, 17U}, 2U}
+    {16U, 64U, 218U, 76U, {0U, 1U, 2U, 3U}, 4U},
+    {246U, 64U, 218U, 76U, {0U, 1U, 4U, 5U}, 4U},
+    {16U, 152U, 218U, 76U, {6U, 7U, 8U, 9U, 10U}, 5U},
+    {246U, 152U, 218U, 76U, {11U, 7U, 8U, 9U, 10U}, 5U},
+    {16U, 240U, 218U, 76U, {12U, 13U, 12U, 14U}, 4U},
+    {246U, 240U, 218U, 76U, {12U, 13U, 15U, 16U}, 4U},
+    {344U, 14U, 120U, 40U, {4U, 17U}, 2U}
 };
 
-static uint8_t ui_m3_button_was_down;
-static M3NextAction_t m3_next_action = M3_ALLOW_EITHER;
-static uint8_t ui_last_state[3] = {0xFFU, 0xFFU, 0xFFU};
-static uint8_t ui_last_direction[3] = {0xFFU, 0xFFU, 0xFFU};
-static uint8_t ui_last_m3_next_action = 0xFFU;
-static uint32_t m3_clamp_count;
-static uint32_t m3_open_count;
-static uint32_t ui_last_clamp_count;
-static uint32_t ui_last_open_count;
+static Instrument_t instruments[INSTRUMENT_COUNT];
+static uint8_t motor_config_ready;
 static volatile uint32_t ui_last_touch_report_ms;
 static uint8_t touch_ready;
-static uint16_t ui_raw_x;
-static uint16_t ui_raw_y;
-static uint8_t ui_raw_valid;
 
 /* Remote (PC / master arm) state. remote_active is set by motion commands. */
 static volatile uint8_t remote_active;
 static volatile uint32_t remote_last_cmd_ms;
-static uint8_t ui_last_remote;
-
-/*
- * M1 "回位" button. m1_return_pending is read from the 20 kHz tick (to keep the
- * 300 ms "no touch -> stop" guard from killing an automatic return), hence the
- * volatile. m1_return_edges records the sensor count at the last return, so the
- * button greys out again until the axis reaches the limit once more.
- */
-static volatile uint8_t m1_return_pending;
-static uint32_t m1_return_edges;
-static uint8_t ui_last_return_ready;
+static volatile uint8_t dual_active[INSTRUMENT_COUNT];
+static uint8_t dual_touch[INSTRUMENT_COUNT];
+static volatile uint8_t dual_rearm[INSTRUMENT_COUNT];
+static volatile uint32_t dual_last_cmd_ms;
+#define DUAL_TIMEOUT_MS 250U
+#define DUAL_LINEAR_HZ 1600
+#define DUAL_ROTARY_HZ 400
 static uint32_t ui_last_pos_ms;
-static int32_t axis_min[MOTOR_COUNT] = {INT32_MIN, INT32_MIN, INT32_MIN};
-static int32_t axis_max[MOTOR_COUNT] = {INT32_MAX, INT32_MAX, INT32_MAX};
+/* Legacy individual-axis commands still address only M1-M3. */
+static int32_t axis_min[3] = {INT32_MIN, INT32_MIN, INT32_MIN};
+static int32_t axis_max[3] = {INT32_MAX, INT32_MAX, INT32_MAX};
 
 /* Photoelectric sensor state; written from the TIM6 tick, read by SENSOR. */
 static volatile uint8_t  photo_level;        /* debounced: 1 = beam blocked */
@@ -289,6 +299,11 @@ static uint8_t  photo_same;
 static volatile uint8_t photo_alert_on;
 static uint8_t  photo_alert_started;
 static uint16_t photo_alert_div;
+static uint8_t photo4_enabled;
+static uint8_t photo4_level;
+static uint8_t photo4_candidate;
+static uint8_t photo4_same;
+static volatile uint32_t photo4_edges;
 
 /**
   * @brief  主函数
@@ -332,7 +347,7 @@ int main(void)
     Photo_GPIO_Config();
 
     printf("欢迎使用野火开发板 \r\n");
-    printf("三电机触摸控制程序启动 \r\n");
+    printf("Dual instrument touch control\r\n");
         
     /* Initialize the display before drawing. Do not use null LCD callbacks. */
     if (LCD_Draw_Config() != 0U)
@@ -364,25 +379,8 @@ int main(void)
 
     if (UI_STAGED_DIAGNOSTIC != 0U)
     {
-        uint8_t button_index;
-
         LED_RGBOFF;
         LED_GREEN;
-        lcd_fill_color(0U, 0U, LCD_X_LENGTH, LCD_Y_LENGTH, BLACK);
-        for (button_index = 0U; button_index < 7U; button_index++)
-        {
-            lcd_fill_color(buttons[button_index].x, buttons[button_index].y,
-                           buttons[button_index].width, buttons[button_index].height, BLUE);
-        }
-        HAL_Delay(4000);
-
-        LED_RGBOFF;
-        LED_BLUE;
-        LCD_DispString_EN(20U, 25U, "STEPPER MOTOR CONTROL", YELLOW, BLACK, &Font16x24);
-        HAL_Delay(4000);
-
-        LED_RGBOFF;
-        LED_CYAN;
         UI_Draw();
         HAL_Delay(4000);
 
@@ -403,18 +401,7 @@ int main(void)
         while (1)
         {
             UI_ProcessTouch();
-            if ((ui_last_state[0] != motors[0].running) ||
-                (ui_last_state[1] != motors[1].running) ||
-                (ui_last_state[2] != motors[2].running) ||
-                (ui_last_direction[0] != motors[0].direction) ||
-                (ui_last_direction[1] != motors[1].direction) ||
-                (ui_last_direction[2] != motors[2].direction) ||
-                (ui_last_m3_next_action != (uint8_t)m3_next_action) ||
-                (ui_last_clamp_count != m3_clamp_count) ||
-                (ui_last_open_count != m3_open_count))
-            {
-                UI_Draw();
-            }
+            UI_Refresh();
             HAL_Delay(10);
         }
     }
@@ -440,62 +427,89 @@ int main(void)
             Isolator_StaticTest_Update();
         }
 
-        /* The timer creates pulses. The main loop only handles touch and UI. */
-        if ((m1_return_pending != 0U) && (motors[0].running == 0U))
-        {
-            /* The return move ran out of pulses: disarm 回位 until the next edge. */
-            m1_return_pending = 0U;
-            m1_return_edges = photo_edges;
-        }
-
-        /* Keep the M1 pulse count live (2 Hz) so a truncated move is obvious. */
-        if ((uint32_t)(HAL_GetTick() - ui_last_pos_ms) >= 500U)
-        {
-            char pos_text[24];
-
-            ui_last_pos_ms = HAL_GetTick();
-            sprintf(pos_text, "M1:%ld    ", (long)motors[0].position);
-            lcd_fill_color(366U, 24U, 114U, 26U, BLACK);
-            LCD_DispString_EN(366U, 26U, pos_text, WHITE, BLACK, &Font8x16);
-        }
-
-        if ((ui_last_state[0] != motors[0].running) ||
-            (ui_last_state[1] != motors[1].running) ||
-            (ui_last_state[2] != motors[2].running) ||
-            (ui_last_direction[0] != motors[0].direction) ||
-            (ui_last_direction[1] != motors[1].direction) ||
-            (ui_last_direction[2] != motors[2].direction) ||
-            (ui_last_m3_next_action != (uint8_t)m3_next_action) ||
-            (ui_last_clamp_count != m3_clamp_count) ||
-            (ui_last_open_count != m3_open_count) ||
-            (ui_last_return_ready != UI_M1ReturnEnabled()) ||
-            (ui_last_remote != remote_active))
-        {
-            UI_Draw();
-        }
+        UI_Refresh();
 
         HAL_Delay(10);
     }
 }
 
+static uint8_t GPIO_EnableClock(GPIO_TypeDef *port)
+{
+    if      (port == GPIOA) { __HAL_RCC_GPIOA_CLK_ENABLE(); }
+    else if (port == GPIOB) { __HAL_RCC_GPIOB_CLK_ENABLE(); }
+    else if (port == GPIOC) { __HAL_RCC_GPIOC_CLK_ENABLE(); }
+    else if (port == GPIOD) { __HAL_RCC_GPIOD_CLK_ENABLE(); }
+    else if (port == GPIOE) { __HAL_RCC_GPIOE_CLK_ENABLE(); }
+    else if (port == GPIOF) { __HAL_RCC_GPIOF_CLK_ENABLE(); }
+    else if (port == GPIOG) { __HAL_RCC_GPIOG_CLK_ENABLE(); }
+    else if (port == GPIOH) { __HAL_RCC_GPIOH_CLK_ENABLE(); }
+    else if (port == GPIOI) { __HAL_RCC_GPIOI_CLK_ENABLE(); }
+    else { return 0U; }
+    return 1U;
+}
+
+static uint8_t GPIO_IsSinglePin(uint16_t pin)
+{
+    return (pin != 0U) && ((pin & (pin - 1U)) == 0U);
+}
+
+static uint8_t GPIO_SamePin(GPIO_TypeDef *a_port, uint16_t a_pin,
+                            GPIO_TypeDef *b_port, uint16_t b_pin)
+{
+    return a_port == b_port && a_pin == b_pin;
+}
+
+static uint8_t Motor_PinValid(GPIO_TypeDef *port, uint16_t pin)
+{
+    return GPIO_IsSinglePin(pin) &&
+           !GPIO_SamePin(port, pin, PHOTO_GPIO_PORT, PHOTO_GPIO_PIN) &&
+           !(SECOND_INSTRUMENT_ENABLED && GPIO_SamePin(port, pin, MOTOR4_PHOTO_PORT, MOTOR4_PHOTO_PIN)) &&
+           GPIO_EnableClock(port);
+}
+
 static void Motor_GPIO_Config(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
+    uint8_t i;
+    uint8_t j;
 
-    __HAL_RCC_GPIOC_CLK_ENABLE();
-
-    GPIO_InitStruct.Pin = MOTOR1_STEP_PIN | MOTOR1_DIR_PIN |
-                          MOTOR2_STEP_PIN | MOTOR2_DIR_PIN;
-    if (ACTIVE_MOTOR_COUNT == MOTOR_COUNT)
+    for (i = 0U; i < ACTIVE_MOTOR_COUNT; ++i)
     {
-        GPIO_InitStruct.Pin |= MOTOR3_STEP_PIN | MOTOR3_DIR_PIN;
+        const Motor_t *motor = &motors[i];
+        if (!Motor_PinValid(motor->step_port, motor->step_pin) ||
+            !Motor_PinValid(motor->dir_port, motor->dir_pin) ||
+            GPIO_SamePin(motor->step_port, motor->step_pin, motor->dir_port, motor->dir_pin))
+        {
+            printf("ERR M%u PIN CONFIG\r\n", (unsigned)(i + 1U));
+            return;
+        }
+        for (j = 0U; j < i; ++j)
+        {
+            const Motor_t *other = &motors[j];
+            if (GPIO_SamePin(motor->step_port, motor->step_pin, other->step_port, other->step_pin) ||
+                GPIO_SamePin(motor->step_port, motor->step_pin, other->dir_port, other->dir_pin) ||
+                GPIO_SamePin(motor->dir_port, motor->dir_pin, other->step_port, other->step_pin) ||
+                GPIO_SamePin(motor->dir_port, motor->dir_pin, other->dir_port, other->dir_pin))
+            {
+                printf("ERR M%u PIN CONFLICT\r\n", (unsigned)(i + 1U));
+                return;
+            }
+        }
     }
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(MOTOR_GPIO_PORT, &GPIO_InitStruct);
 
-    HAL_GPIO_WritePin(MOTOR_GPIO_PORT, GPIO_InitStruct.Pin, GPIO_PIN_RESET);
+    for (i = 0U; i < ACTIVE_MOTOR_COUNT; ++i)
+    {
+        GPIO_InitStruct.Pin = motors[i].step_pin;
+        HAL_GPIO_WritePin(motors[i].step_port, GPIO_InitStruct.Pin, GPIO_PIN_RESET);
+        HAL_GPIO_Init(motors[i].step_port, &GPIO_InitStruct);
+        GPIO_InitStruct.Pin = motors[i].dir_pin;
+        HAL_GPIO_WritePin(motors[i].dir_port, GPIO_InitStruct.Pin, GPIO_PIN_RESET);
+        HAL_GPIO_Init(motors[i].dir_port, &GPIO_InitStruct);
+    }
+    motor_config_ready = 1U;
 }
 
 static uint8_t Photo_IsActive(uint8_t raw)
@@ -534,6 +548,44 @@ static void Photo_GPIO_Config(void)
     photo_sample_index = 0U;
     photo_edge_sample = 0U;
     photo_has_edge = 0U;
+
+    if (SECOND_INSTRUMENT_ENABLED && motor_config_ready && MOTOR4_RETURN_PULSES > 0L &&
+        GPIO_IsSinglePin(MOTOR4_PHOTO_PIN) &&
+        !(MOTOR4_PHOTO_PORT == PHOTO_GPIO_PORT && MOTOR4_PHOTO_PIN == PHOTO_GPIO_PIN) &&
+        GPIO_EnableClock(MOTOR4_PHOTO_PORT))
+    {
+        GPIO_InitStruct.Pin = MOTOR4_PHOTO_PIN;
+        GPIO_InitStruct.Pull = MOTOR4_PHOTO_ACTIVE_LOW ? GPIO_PULLUP : GPIO_PULLDOWN;
+        HAL_GPIO_Init(MOTOR4_PHOTO_PORT, &GPIO_InitStruct);
+        photo4_level = ((HAL_GPIO_ReadPin(MOTOR4_PHOTO_PORT, MOTOR4_PHOTO_PIN) == GPIO_PIN_RESET)
+                        == (MOTOR4_PHOTO_ACTIVE_LOW != 0U));
+        photo4_candidate = photo4_level;
+        photo4_enabled = 1U;
+    }
+}
+
+static void Photo4_Sample(void)
+{
+    uint8_t active;
+    if (photo4_enabled == 0U)
+        return;
+    active = ((HAL_GPIO_ReadPin(MOTOR4_PHOTO_PORT, MOTOR4_PHOTO_PIN) == GPIO_PIN_RESET)
+              == (MOTOR4_PHOTO_ACTIVE_LOW != 0U));
+    if (active != photo4_candidate)
+    {
+        photo4_candidate = active;
+        photo4_same = 1U;
+    }
+    else if (photo4_same < PHOTO_DEBOUNCE_SAMPLES)
+    {
+        ++photo4_same;
+    }
+    if (photo4_same >= PHOTO_DEBOUNCE_SAMPLES && active != photo4_level)
+    {
+        photo4_level = active;
+        if (active != 0U)
+            ++photo4_edges;
+    }
 }
 
 /*
@@ -553,6 +605,7 @@ static void Photo_SampleTick(void)
     }
     photo_divider = 0U;
     photo_sample_index++;
+    Photo4_Sample();
 
     /* Uses the level committed on the previous sample: one 1 ms tick of lag. */
     Photo_AlertTick();
@@ -728,7 +781,7 @@ static void Motor_Timer_Config(void)
 
 static void Motor_StartContinuous(uint8_t motor_index, MotorDirection_t direction)
 {
-    uint32_t hz = (motor_index == 0U) ? MOTOR1_CONTINUOUS_SPEED_HZ
+    uint32_t hz = (motor_index % 3U == 0U) ? MOTOR1_CONTINUOUS_SPEED_HZ
                                       : MOTOR_CONTINUOUS_SPEED_HZ;
     (void)Motor_StartContinuousHz(motor_index, direction, hz);
 }
@@ -740,7 +793,8 @@ static uint8_t Motor_StartContinuousHz(uint8_t motor_index, MotorDirection_t dir
     Motor_t *motor = &motors[motor_index];
     uint8_t dir_high = (direction == MOTOR_DIR_CW) ? 1U : 0U;
 
-    if (motor_index >= ACTIVE_MOTOR_COUNT)
+    if (motor_index >= ACTIVE_MOTOR_COUNT ||
+        (MOTOR_OUTPUT_ENABLED && !ISOLATOR_STATIC_TEST && !motor_config_ready))
     {
         return 0U;
     }
@@ -760,15 +814,10 @@ static uint8_t Motor_StartContinuousHz(uint8_t motor_index, MotorDirection_t dir
         return 1U;
     }
 
-    if (MOTOR_OUTPUT_ENABLED != 0U)
+    if (MOTOR_OUTPUT_ENABLED && !ISOLATOR_STATIC_TEST)
     {
-        if (((motor_index == 0U) && (MOTOR1_DIR_INVERTED != 0U)) ||
-            ((motor_index == 1U) && (MOTOR2_DIR_INVERTED != 0U)) ||
-            ((motor_index == 2U) && (MOTOR3_DIR_INVERTED != 0U)))
-        {
-            dir_high ^= 1U;
-        }
-        HAL_GPIO_WritePin(MOTOR_GPIO_PORT, motor->dir_pin,
+        dir_high ^= (motor->dir_inverted != 0U);
+        HAL_GPIO_WritePin(motor->dir_port, motor->dir_pin,
                           (dir_high != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
     }
     motor->direction = direction;
@@ -788,7 +837,8 @@ static uint8_t Motor_StartMove(uint8_t motor_index, int32_t pulses, uint32_t hz)
     uint8_t dir_high;
     uint32_t magnitude;
 
-    if (motor_index >= ACTIVE_MOTOR_COUNT)
+    if (motor_index >= ACTIVE_MOTOR_COUNT ||
+        (MOTOR_OUTPUT_ENABLED && !ISOLATOR_STATIC_TEST && !motor_config_ready))
     {
         return 0U;
     }
@@ -806,18 +856,13 @@ static uint8_t Motor_StartMove(uint8_t motor_index, int32_t pulses, uint32_t hz)
     }
 
     direction = (pulses > 0) ? MOTOR_DIR_CW : MOTOR_DIR_CCW;
-    magnitude = (pulses > 0) ? (uint32_t)pulses : (uint32_t)(-pulses);
+    magnitude = (pulses > 0) ? (uint32_t)pulses : (0U - (uint32_t)pulses);
     dir_high = (direction == MOTOR_DIR_CW) ? 1U : 0U;
 
-    if (MOTOR_OUTPUT_ENABLED != 0U)
+    if (MOTOR_OUTPUT_ENABLED && !ISOLATOR_STATIC_TEST)
     {
-        if (((motor_index == 0U) && (MOTOR1_DIR_INVERTED != 0U)) ||
-            ((motor_index == 1U) && (MOTOR2_DIR_INVERTED != 0U)) ||
-            ((motor_index == 2U) && (MOTOR3_DIR_INVERTED != 0U)))
-        {
-            dir_high ^= 1U;
-        }
-        HAL_GPIO_WritePin(MOTOR_GPIO_PORT, motor->dir_pin,
+        dir_high ^= (motor->dir_inverted != 0U);
+        HAL_GPIO_WritePin(motor->dir_port, motor->dir_pin,
                           (dir_high != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
     }
     motor->direction = direction;
@@ -834,46 +879,46 @@ static void Motor_Stop(uint8_t motor_index)
     motors[motor_index].running = 0U;
 }
 
-static uint8_t Motor_StartFixedMove(MotorDirection_t direction)
+static uint8_t Motor_StartFixedMove(uint8_t group, MotorDirection_t direction)
 {
-    Motor_t *motor = &motors[2];
-
-    if (ACTIVE_MOTOR_COUNT < MOTOR_COUNT)
-    {
-        return 0U;
-    }
+    uint8_t index = group * 3U + 2U;
+    Motor_t *motor = &motors[index];
+    Instrument_t *instrument = &instruments[group];
+    int32_t pulses = (group == 0U) ? MOTOR3_TRAVEL_PULSES : MOTOR6_TRAVEL_PULSES;
 
     if ((motor->running != 0U) ||
-        ((direction == MOTOR_DIR_CW) && (m3_next_action == M3_ALLOW_OPEN)) ||
-        ((direction == MOTOR_DIR_CCW) && (m3_next_action == M3_ALLOW_CLAMP)))
+        ((direction == MOTOR_DIR_CW) && (instrument->next_action == M3_ALLOW_OPEN)) ||
+        ((direction == MOTOR_DIR_CCW) && (instrument->next_action == M3_ALLOW_CLAMP)) ||
+        (pulses <= 0) ||
+        !Motor_StartMove(index, (direction == MOTOR_DIR_CW) ? pulses : -pulses, MOTOR3_SPEED_HZ))
     {
         return 0U;
     }
 
-    if (MOTOR_OUTPUT_ENABLED != 0U)
-    {
-        uint8_t dir_high = (direction == MOTOR_DIR_CW) ? 1U : 0U;
-
-        if (MOTOR3_DIR_INVERTED != 0U)
-        {
-            dir_high ^= 1U;
-        }
-        HAL_GPIO_WritePin(MOTOR_GPIO_PORT, motor->dir_pin,
-                          (dir_high != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    }
-    motor->direction = direction;
-    motor->phase_accumulator = 0U;
-    motor->speed_now_hz = 0U;
-    motor->pulses_remaining = MOTOR3_TRAVEL_PULSES;
-    motor->pulse_frequency_hz = MOTOR3_SPEED_HZ;
-    motor->running = 1U;
-    m3_next_action = (direction == MOTOR_DIR_CW) ? M3_ALLOW_OPEN : M3_ALLOW_CLAMP;
+    instrument->next_action = (direction == MOTOR_DIR_CW) ? M3_ALLOW_OPEN : M3_ALLOW_CLAMP;
+    if (direction == MOTOR_DIR_CW)
+        ++instrument->clamp_count;
+    else
+        ++instrument->open_count;
     return 1U;
 }
 
 static void Motor_Service(void)
 {
     uint8_t motor_index;
+    uint8_t group;
+    uint32_t now = HAL_GetTick();
+
+    for (group = 0U; group < INSTRUMENT_COUNT; ++group)
+    {
+        if (dual_active[group] && (uint32_t)(now - dual_last_cmd_ms) >= DUAL_TIMEOUT_MS)
+        {
+            Motor_Stop(group * 3U);
+            Motor_Stop(group * 3U + 1U);
+            dual_rearm[group] = 1U;
+            dual_active[group] = 0U;
+        }
+    }
 
     if (remote_active != 0U)
     {
@@ -885,11 +930,16 @@ static void Motor_Service(void)
             remote_active = 0U;
         }
     }
-    else if ((m1_return_pending == 0U) &&
-             ((uint32_t)(HAL_GetTick() - ui_last_touch_report_ms) > TOUCH_REPORT_TIMEOUT_MS))
+    if ((uint32_t)(HAL_GetTick() - ui_last_touch_report_ms) > TOUCH_REPORT_TIMEOUT_MS)
     {
-        motors[0].running = 0U;
-        motors[1].running = 0U;
+        for (group = 0U; group < INSTRUMENT_COUNT; ++group)
+        {
+            if (dual_active[group] || (group == 0U && remote_active))
+                continue;
+            if (instruments[group].return_pending == 0U)
+                Motor_Stop(group * 3U);
+            Motor_Stop(group * 3U + 1U);
+        }
     }
 
     for (motor_index = 0U; motor_index < MOTOR_COUNT; motor_index++)
@@ -905,7 +955,7 @@ static void Motor_Service(void)
         {
             if (MOTOR_OUTPUT_ENABLED != 0U)
             {
-                HAL_GPIO_WritePin(MOTOR_GPIO_PORT, motor->step_pin, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(motor->step_port, motor->step_pin, GPIO_PIN_RESET);
             }
             motor->step_high = 0U;
         }
@@ -939,7 +989,7 @@ static void Motor_Service(void)
             motor->phase_accumulator -= MOTOR_TIMER_TICK_HZ;
             if (MOTOR_OUTPUT_ENABLED != 0U)
             {
-                HAL_GPIO_WritePin(MOTOR_GPIO_PORT, motor->step_pin, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(motor->step_port, motor->step_pin, GPIO_PIN_SET);
             }
             motor->step_high = 1U;
 
@@ -979,285 +1029,274 @@ static void UI_DrawGlyph(uint16_t x, uint16_t y, uint8_t glyph_index, uint16_t b
     uint8_t row;
     uint8_t col;
 
-    lcd_open_window(x, y, 32U, 32U);
-    for (row = 0U; row < 32U; row++)
+    lcd_open_window(x, y, UI_GLYPH_SIZE, UI_GLYPH_SIZE);
+    for (row = 0U; row < UI_GLYPH_SIZE; row++)
     {
-        for (col = 0U; col < 32U; col++)
+        for (col = 0U; col < UI_GLYPH_SIZE; col++)
         {
-            uint8_t pixel = glyph[(uint16_t)row * 4U + col / 8U] &
-                            (uint8_t)(0x80U >> (col % 8U));
-            LCD_WRITE_DATA((pixel != 0U) ? WHITE : background);
+            uint8_t src_row = row * 32U / UI_GLYPH_SIZE;
+            uint8_t src_col = col * 32U / UI_GLYPH_SIZE;
+            uint8_t pixel = glyph[(uint16_t)src_row * 4U + src_col / 8U] &
+                            (uint8_t)(0x80U >> (src_col % 8U));
+            LCD_WRITE_DATA(pixel ? (background == YELLOW || background == GREEN ? BLACK : WHITE) : background);
         }
     }
 }
 
-static void UI_DrawButton(const Button_t *button, uint16_t color)
+static void UI_DrawButton(const Button_t *button, uint16_t top, uint16_t color)
 {
-    uint16_t text_x = button->x + (button->width - (uint16_t)button->label_length * 32U) / 2U;
-    uint16_t text_y = button->y + (button->height - 32U) / 2U;
+    uint16_t y = top + button->y;
+    uint16_t text_x = button->x + (button->width - (uint16_t)button->label_length * UI_GLYPH_SIZE) / 2U;
+    uint16_t text_y = y + (button->height - UI_GLYPH_SIZE) / 2U;
     uint8_t index;
 
-    lcd_fill_color(button->x, button->y, button->width, button->height, color);
+    lcd_fill_color(button->x, y, button->width, button->height, color);
     /*
      * Avoid LCD_Draw_Line here: the example's implementation mishandles
      * decreasing coordinates. Four filled 1-pixel strips are safe borders.
      */
-    lcd_fill_color(button->x, button->y, button->width, 1U, WHITE);
-    lcd_fill_color(button->x, button->y + button->height - 1U, button->width, 1U, WHITE);
-    lcd_fill_color(button->x, button->y, 1U, button->height, WHITE);
-    lcd_fill_color(button->x + button->width - 1U, button->y, 1U, button->height, WHITE);
+    lcd_fill_color(button->x, y, button->width, 1U, WHITE);
+    lcd_fill_color(button->x, y + button->height - 1U, button->width, 1U, WHITE);
+    lcd_fill_color(button->x, y, 1U, button->height, WHITE);
+    lcd_fill_color(button->x + button->width - 1U, y, 1U, button->height, WHITE);
     for (index = 0U; index < button->label_length; index++)
     {
-        UI_DrawGlyph((uint16_t)(text_x + (uint16_t)index * 32U), text_y,
+        UI_DrawGlyph((uint16_t)(text_x + (uint16_t)index * UI_GLYPH_SIZE), text_y,
                      button->label_glyphs[index], color);
     }
 }
 
-static void UI_DrawRawTouch(void)
+static uint8_t UI_GroupEnabled(uint8_t group)
 {
-    char position_text[32];
-
-    if (ui_raw_valid == 0U)
-    {
-        return;
-    }
-
-    sprintf(position_text, "RAW X:%4u  Y:%4u", ui_raw_x, ui_raw_y);
-    lcd_fill_color(0U, 756U, LCD_X_LENGTH, 32U, BLACK);
-    LCD_DispString_EN(20U, 760U, position_text, CYAN, BLACK, &Font16x24);
+    return (group * 3U < ACTIVE_MOTOR_COUNT) &&
+           (!MOTOR_OUTPUT_ENABLED || ISOLATOR_STATIC_TEST || motor_config_ready);
 }
 
-/* 回位 is armed only while the sensor has produced an edge since the last return. */
-static uint8_t UI_M1ReturnEnabled(void)
+static uint32_t UI_ReturnEdges(uint8_t group)
 {
-    /*
-     * A "SENSOR RESET" from the PC clears photo_edges. Without this the stored
-     * baseline would stay above the counter and the button would never arm again.
-     */
-    if (photo_edges < m1_return_edges)
+    return (group == 0U) ? photo_edges : photo4_edges;
+}
+
+static uint8_t UI_ReturnEnabled(uint8_t group)
+{
+    Instrument_t *instrument = &instruments[group];
+    uint32_t edges = UI_ReturnEdges(group);
+    /* The legacy SENSOR RESET command can lower the M1 counter. */
+    if (edges < instrument->return_edges)
+        instrument->return_edges = edges;
+    return (group == 0U || photo4_enabled) && edges > instrument->return_edges;
+}
+
+static uint16_t UI_ButtonColor(uint8_t group, uint8_t index)
+{
+    const Instrument_t *instrument = &instruments[group];
+    uint8_t forward = (index & 1U) == 0U;
+    const Motor_t *motor;
+
+    if (!UI_GroupEnabled(group))
+        return GRAY;
+    if (index == 6U)
     {
-        m1_return_edges = photo_edges;
+        if (instrument->return_pending)
+            return GREEN;
+        return (motors[group * 3U].running == 0U && UI_ReturnEnabled(group)) ? YELLOW : GRAY;
     }
-    return (photo_edges > m1_return_edges) ? 1U : 0U;
+    motor = &motors[group * 3U + index / 2U];
+    if (motor->running && motor->direction == (forward ? MOTOR_DIR_CW : MOTOR_DIR_CCW))
+        return GREEN;
+    if (index >= 4U && (motor->running ||
+        instrument->next_action == (forward ? M3_ALLOW_OPEN : M3_ALLOW_CLAMP)))
+        return GRAY;
+    return BLUE;
+}
+
+static void UI_Refresh(void)
+{
+    uint8_t group;
+    uint32_t now = HAL_GetTick();
+    uint8_t refresh_position = (uint32_t)(now - ui_last_pos_ms) >= 500U;
+
+    for (group = 0U; group < INSTRUMENT_COUNT; ++group)
+    {
+        uint16_t top = group * (LCD_Y_LENGTH / 2U);
+        Instrument_t *instrument = &instruments[group];
+        uint8_t base = group * 3U;
+        uint8_t remote = dual_active[group] || (group == 0U && remote_active);
+        uint8_t index;
+        char text[48];
+
+        if (instrument->return_pending && !motors[base].running)
+            instrument->return_pending = 0U;
+        for (index = 0U; index < BUTTON_COUNT; ++index)
+        {
+            uint16_t color = UI_ButtonColor(group, index);
+            if (color != instrument->last_colors[index])
+            {
+                UI_DrawButton(&buttons[index], top, color);
+                instrument->last_colors[index] = color;
+            }
+        }
+        if (refresh_position)
+        {
+            lcd_fill_color(16U, top + 332U, 432U, 16U, BLACK);
+            sprintf(text, "M%u POS:%ld pulses", (unsigned)(base + 1U), (long)motors[base].position);
+            LCD_DispString_EN(16U, top + 332U, text, WHITE, BLACK, &Font8x16);
+        }
+        if (instrument->last_clamp_count != instrument->clamp_count ||
+            instrument->last_open_count != instrument->open_count || instrument->last_remote != remote)
+        {
+            lcd_fill_color(16U, top + 356U, 432U, 16U, BLACK);
+            if (UI_GroupEnabled(group))
+                sprintf(text, "CLAMP:%lu  OPEN:%lu  %s", (unsigned long)instrument->clamp_count,
+                        (unsigned long)instrument->open_count, remote ? "REMOTE" : "LOCAL");
+            else
+                strcpy(text, "DISABLED: CHECK PIN CONFIG");
+            LCD_DispString_EN(16U, top + 356U, text, CYAN, BLACK, &Font8x16);
+            instrument->last_clamp_count = instrument->clamp_count;
+            instrument->last_open_count = instrument->open_count;
+            instrument->last_remote = remote;
+        }
+    }
+    if (refresh_position)
+        ui_last_pos_ms = now;
 }
 
 static void UI_Draw(void)
 {
-    char status_text[48];
-    char count_text[48];
-
+    uint8_t group;
     lcd_fill_color(0U, 0U, LCD_X_LENGTH, LCD_Y_LENGTH, BLACK);
-    LCD_DispString_EN(20U, 25U, "STEPPER MOTOR CONTROL", YELLOW, BLACK, &Font16x24);
-
-    /* Live M1 pulse count: the same reference the 回位 button returns to. */
-    sprintf(count_text, "M1:%ld", (long)motors[0].position);
-    LCD_DispString_EN(366U, 26U, count_text, WHITE, BLACK, &Font8x16);
-
-    UI_DrawButton(&buttons[0], (motors[0].running != 0U && motors[0].direction == MOTOR_DIR_CW) ? GREEN : BLUE);
-    UI_DrawButton(&buttons[1], (motors[0].running != 0U && motors[0].direction == MOTOR_DIR_CCW) ? GREEN : BLUE);
-    UI_DrawButton(&buttons[2], (motors[1].running != 0U && motors[1].direction == MOTOR_DIR_CW) ? GREEN : BLUE);
-    UI_DrawButton(&buttons[3], (motors[1].running != 0U && motors[1].direction == MOTOR_DIR_CCW) ? GREEN : BLUE);
-    UI_DrawButton(&buttons[4],
-                  (motors[2].running != 0U && motors[2].direction == MOTOR_DIR_CW) ? GREEN :
-                  (motors[2].running != 0U || m3_next_action == M3_ALLOW_OPEN) ? GRAY : BLUE);
-    UI_DrawButton(&buttons[5],
-                  (motors[2].running != 0U && motors[2].direction == MOTOR_DIR_CCW) ? GREEN :
-                  (motors[2].running != 0U || m3_next_action == M3_ALLOW_CLAMP) ? GRAY : BLUE);
-    UI_DrawButton(&buttons[6],
-                  (m1_return_pending != 0U) ? GREEN :
-                  (UI_M1ReturnEnabled() != 0U) ? YELLOW : GRAY);
-
-    /* Counts are accepted commands, not measured position or clamp force. */
-    sprintf(count_text, "CLAMP:%lu  OPEN:%lu",
-            (unsigned long)m3_clamp_count, (unsigned long)m3_open_count);
-    LCD_DispString_EN(20U, 646U, count_text, CYAN, BLACK, &Font16x24);
-
-    sprintf(status_text, "M1:%s  M2:%s  M3:%s",
-            (motors[0].running != 0U) ? "RUN" : "STOP",
-            (motors[1].running != 0U) ? "RUN" : "STOP",
-            (motors[2].running != 0U) ? "MOVE" : "STOP");
-    if (remote_active != 0U)
+    for (group = 0U; group < INSTRUMENT_COUNT; ++group)
     {
-        strcat(status_text, " REMOTE");
+        uint16_t top = group * (LCD_Y_LENGTH / 2U);
+        char title[24];
+        sprintf(title, "SET %u / M%u-M%u", (unsigned)(group + 1U),
+                (unsigned)(group * 3U + 1U), (unsigned)(group * 3U + 3U));
+        lcd_fill_color(0U, top, LCD_X_LENGTH, 2U, group == 0U ? CYAN : YELLOW);
+        LCD_DispString_EN(16U, top + 20U, title, group == 0U ? CYAN : YELLOW, BLACK, &Font16x24);
+        instruments[group].last_remote = 0xFFU;
+        memset(instruments[group].last_colors, 0xFF, sizeof(instruments[group].last_colors));
     }
-    LCD_DispString_EN(20U, 680U, status_text, WHITE, BLACK, &Font16x24);
-    if (ACTIVE_MOTOR_COUNT < MOTOR_COUNT)
-    {
-        LCD_DispString_EN(20U, 720U, "M1/M2 TEST; M3 DISABLED", YELLOW, BLACK, &Font16x24);
-    }
-    else
-    {
-        if (motors[2].running != 0U)
-            sprintf(count_text, "M3 MOVING 65 x 45 DEG");
-        else if (m3_next_action == M3_ALLOW_OPEN)
-            sprintf(count_text, "M3 NEXT:OPEN 65 x 45 DEG");
-        else if (m3_next_action == M3_ALLOW_CLAMP)
-            sprintf(count_text, "M3 NEXT:CLAMP 65 x 45 DEG");
-        else
-            sprintf(count_text, "M3 65 x 45 DEG");
-        LCD_DispString_EN(20U, 720U, count_text, YELLOW, BLACK, &Font16x24);
-    }
-    UI_DrawRawTouch();
-
-    ui_last_state[0] = motors[0].running;
-    ui_last_state[1] = motors[1].running;
-    ui_last_state[2] = motors[2].running;
-    ui_last_direction[0] = motors[0].direction;
-    ui_last_direction[1] = motors[1].direction;
-    ui_last_direction[2] = motors[2].direction;
-    ui_last_m3_next_action = (uint8_t)m3_next_action;
-    ui_last_clamp_count = m3_clamp_count;
-    ui_last_open_count = m3_open_count;
-    ui_last_return_ready = UI_M1ReturnEnabled();
-    ui_last_remote = remote_active;
+    ui_last_pos_ms = HAL_GetTick() - 500U;
+    UI_Refresh();
 }
 
 static void UI_ProcessTouch(void)
 {
-    uint8_t m1_command = 0U;
-    uint8_t m2_command = 0U;
-    uint8_t m3_command = 0U;
-    uint8_t m1_return_command = 0U;
-    uint8_t touch_result = 3U;
-    uint8_t point_index;
-    uint16_t screen_x;
-    uint16_t screen_y;
+    uint8_t commands[INSTRUMENT_COUNT][4] = {{0U}};
+    uint16_t clamp_ids[INSTRUMENT_COUNT] = {0U};
+    uint16_t live_ids = 0U;
+    uint16_t half = LCD_Y_LENGTH / 2U;
+    uint8_t result = 3U;
+    int8_t point;
+    uint8_t group;
 
     if (touch_ready != 0U)
     {
-        touch_result = LCD_Touch_Get_Points_Data(touch_points, &touch_points_num);
-
-        if (touch_result == 0U)
-        {
+        result = LCD_Touch_Get_Points_Data(touch_points, &touch_points_num);
+        if (result == 0U)
             ui_last_touch_report_ms = HAL_GetTick();
-            if (touch_points_num > 0)
+    }
+    if (result != 0U && (result != 2U ||
+        (uint32_t)(HAL_GetTick() - ui_last_touch_report_ms) > TOUCH_REPORT_TIMEOUT_MS))
+        touch_points_num = 0;
+
+    for (point = 0; point < touch_points_num; ++point)
+    {
+        const Touch_Point_t *touch = &touch_points[point];
+        uint16_t id = (uint16_t)(1U << touch->track_id);
+        uint16_t y;
+        uint8_t button;
+        live_ids |= id;
+        /* Keep the existing GT911 to LCD scan-mode-6 transform. */
+        if (touch->x >= LCD_Y_LENGTH || touch->y >= LCD_X_LENGTH)
+            continue;
+        y = LCD_Y_LENGTH - 1U - touch->x;
+        group = (y >= half) ? 1U : 0U;
+        y -= group * half;
+        for (button = 0U; button < BUTTON_COUNT; ++button)
+        {
+            if (UI_PointInButton(touch->y, y, &buttons[button]))
             {
-                ui_raw_x = touch_points[0].x;
-                ui_raw_y = touch_points[0].y;
-                ui_raw_valid = 1U;
-                UI_DrawRawTouch();
+                commands[group][button / 2U] |= (uint8_t)(1U << (button & 1U));
+                if (button == 4U || button == 5U)
+                    clamp_ids[group] |= id;
+                break;
             }
         }
-        else if ((touch_result != 2U) ||
-                 ((uint32_t)(HAL_GetTick() - ui_last_touch_report_ms) > TOUCH_REPORT_TIMEOUT_MS))
-        {
-            touch_points_num = 0;
-        }
-    }
-    else
-    {
-        touch_points_num = 0;
     }
 
-    for (point_index = 0U; point_index < (uint8_t)touch_points_num; point_index++)
+    for (group = 0U; group < INSTRUMENT_COUNT; ++group)
     {
-        /* The touch sensor is rotated 90 degrees relative to LCD scan mode 6. */
-        if ((touch_points[point_index].x >= LCD_Y_LENGTH) ||
-            (touch_points[point_index].y >= LCD_X_LENGTH))
-        {
+        Instrument_t *instrument = &instruments[group];
+        const uint8_t *command = commands[group];
+        uint8_t base = group * 3U;
+        uint8_t axis;
+
+        if (!UI_GroupEnabled(group))
             continue;
-        }
-        screen_x = touch_points[point_index].y;
-        screen_y = (uint16_t)(LCD_Y_LENGTH - 1U - touch_points[point_index].x);
-
-        if (UI_PointInButton(screen_x, screen_y, &buttons[0]) != 0U)
-            m1_command = 1U;
-        else if (UI_PointInButton(screen_x, screen_y, &buttons[1]) != 0U)
-            m1_command = 2U;
-        else if (UI_PointInButton(screen_x, screen_y, &buttons[2]) != 0U)
-            m2_command = 1U;
-        else if (UI_PointInButton(screen_x, screen_y, &buttons[3]) != 0U)
-            m2_command = 2U;
-        else if (UI_PointInButton(screen_x, screen_y, &buttons[4]) != 0U)
-            m3_command = 1U;
-        else if (UI_PointInButton(screen_x, screen_y, &buttons[5]) != 0U)
-            m3_command = 2U;
-        else if (UI_PointInButton(screen_x, screen_y, &buttons[6]) != 0U)
-            m1_return_command = 1U;
-    }
-
-    /*
-     * In remote mode the PC owns M1/M2. A touch on any button hands control
-     * back to the LCD panel; without a touch, leave the motors alone (the old
-     * "no touch -> stop" logic must not fight the bridge).
-     */
-    if (remote_active != 0U)
-    {
-        if ((m1_command | m2_command | m3_command | m1_return_command) != 0U)
+        dual_touch[group] = (command[0] | command[1] | command[3]) != 0U;
+        if (dual_touch[group] && dual_active[group])
         {
+            Motor_Stop(base);
+            Motor_Stop(base + 1U);
+            dual_active[group] = 0U;
+            dual_rearm[group] = 1U;
+        }
+        /* Keep the legacy single-hand arbitration unchanged. */
+        if (group == 0U && remote_active)
+        {
+            if (!(command[0] | command[1] | command[2] | command[3]))
+            {
+                if (result == 0U)
+                {
+                    instrument->held_clamp_ids &= live_ids;
+                    instrument->return_was_down = 0U;
+                }
+                continue;
+            }
             remote_active = 0U;
         }
-        else
+
+        if (result == 0U)
         {
-            return;
-        }
-    }
-
-    /*
-     * 回位: only when M1 is idle and the sensor has counted a new edge.
-     * The move is always the measured initial->limit distance, not "whatever
-     * the counter reads now", so one press always brings the axis all the way
-     * back even if the position reference was reset by a board restart.
-     */
-    if (m1_return_command != 0U)
-    {
-        if ((m1_return_pending == 0U) && (motors[0].running == 0U) &&
-            (UI_M1ReturnEnabled() != 0U))
-        {
-            (void)Motor_StartMove(0U, -(int32_t)MOTOR1_HOME_PULSES,
-                                  MOTOR1_RETURN_SPEED_HZ);
-            m1_return_pending = 1U;
-        }
-    }
-
-    if (m1_command != 0U)
-    {
-        /* A hand command always wins over an automatic return. */
-        m1_return_pending = 0U;
-    }
-
-    if (m1_command == 1U)
-        Motor_StartContinuous(0U, MOTOR_DIR_CW);
-    else if (m1_command == 2U)
-        Motor_StartContinuous(0U, MOTOR_DIR_CCW);
-    else if (m1_return_pending == 0U)
-        Motor_Stop(0U);
-
-    if (ACTIVE_MOTOR_COUNT >= 2U)
-    {
-        if (m2_command == 1U)
-            Motor_StartContinuous(1U, MOTOR_DIR_CW);
-        else if (m2_command == 2U)
-            Motor_StartContinuous(1U, MOTOR_DIR_CCW);
-        else
-            Motor_Stop(1U);
-    }
-
-    if (ACTIVE_MOTOR_COUNT == MOTOR_COUNT)
-    {
-        if ((m3_command != 0U) && (ui_m3_button_was_down == 0U))
-        {
-            if (Motor_StartFixedMove((m3_command == 1U) ? MOTOR_DIR_CW : MOTOR_DIR_CCW) != 0U)
+            if (command[3] && !instrument->return_was_down && !command[0] &&
+                !motors[base].running && UI_ReturnEnabled(group))
             {
-                if (m3_command == 1U)
-                    m3_clamp_count++;
-                else
-                    m3_open_count++;
+                int32_t pulses = group == 0U ? MOTOR1_HOME_PULSES : MOTOR4_RETURN_PULSES;
+                uint32_t edges = UI_ReturnEdges(group);
+                if (Motor_StartMove(base, -pulses, MOTOR1_RETURN_SPEED_HZ))
+                {
+                    instrument->return_pending = 1U;
+                    instrument->return_edges = edges;
+                }
             }
-        }
-    }
+            instrument->return_was_down = command[3] != 0U;
 
-    if (m3_command != 0U)
-    {
-        ui_m3_button_was_down = 1U;
-    }
-    else if ((touch_result == 0U) && (touch_points_num == 0))
-    {
-        /* Only a fresh, explicit release re-arms the M3 button edge. */
-        ui_m3_button_was_down = 0U;
+            /* Rearm when this finger lifts, even if the other panel is held. */
+            instrument->held_clamp_ids &= live_ids;
+            if ((clamp_ids[group] & ~instrument->held_clamp_ids) &&
+                (command[2] == 1U || command[2] == 2U))
+                (void)Motor_StartFixedMove(group, command[2] == 1U ? MOTOR_DIR_CW : MOTOR_DIR_CCW);
+            instrument->held_clamp_ids |= clamp_ids[group];
+        }
+
+        if (dual_active[group])
+            continue; /* Clamp events above remain local even during remote jog. */
+
+        if (command[0] != 0U && instrument->return_pending)
+        {
+            Motor_Stop(base);
+            instrument->return_pending = 0U;
+        }
+        for (axis = 0U; axis < 2U; ++axis)
+        {
+            if (command[axis] == 1U || command[axis] == 2U)
+                Motor_StartContinuous(base + axis, command[axis] == 1U ? MOTOR_DIR_CW : MOTOR_DIR_CCW);
+            else if (axis != 0U || !instrument->return_pending)
+                Motor_Stop(base + axis); /* Includes conflicting direction touches. */
+        }
     }
 }
-
 
 static void Remote_Upper(char *text)
 {
@@ -1297,6 +1336,91 @@ static uint32_t Remote_ToHz(const char *text, uint32_t fallback)
         return fallback;
     }
     return (uint32_t)value;
+}
+
+static void Remote_DualRelease(uint8_t group)
+{
+    if (dual_active[group])
+    {
+        Motor_Stop(group * 3U);
+        Motor_Stop(group * 3U + 1U);
+        dual_active[group] = 0U;
+    }
+}
+
+/* A = armed with zero rate, so returning to the deadband is not a release. */
+static void Remote_DualVelocity(char **argv, uint8_t argc)
+{
+    long rate[4];
+    uint8_t armed[2];
+    uint8_t i;
+    uint8_t group;
+    uint32_t primask;
+
+    if (argc != 5U || !UI_GroupEnabled(1U) || remote_active ||
+        ISOLATOR_STATIC_TEST || !MOTOR_OUTPUT_ENABLED || !motor_config_ready)
+    {
+        printf("ERR DUAL UNAVAILABLE\r\n");
+        return;
+    }
+    for (i = 0U; i < 4U; ++i)
+    {
+        char *end;
+        long cap = (i % 2U == 0U) ? DUAL_LINEAR_HZ : DUAL_ROTARY_HZ;
+        const char *text = argv[i + 1U];
+        rate[i] = strtol(text, &end, 10);
+        if (end == text || *end != '\0' || rate[i] < -cap || rate[i] > cap)
+        {
+            if (strcmp(text, "A") != 0 || i % 2U != 0U)
+            {
+                printf("ERR DUAL RATE\r\n");
+                return;
+            }
+            rate[i] = 0;
+        }
+        if (i % 2U != 0U)
+        {
+            armed[i / 2U] = rate[i] != 0 || rate[i - 1U] != 0 ||
+                strcmp(argv[i], "A") == 0;
+            if (rate[i] != 0 && rate[i - 1U] != 0)
+            {
+                printf("ERR DUAL MODE\r\n");
+                return;
+            }
+        }
+    }
+    primask = __get_PRIMASK();
+    __disable_irq();
+    dual_last_cmd_ms = HAL_GetTick();
+    for (group = 0U; group < INSTRUMENT_COUNT; ++group)
+    {
+        uint8_t axis;
+        if (!armed[group])
+        {
+            Remote_DualRelease(group);
+            dual_rearm[group] = 0U;
+            continue;
+        }
+        if (dual_touch[group] || instruments[group].return_pending || dual_rearm[group])
+        {
+            Remote_DualRelease(group);
+            dual_rearm[group] = 1U;
+            continue;
+        }
+        dual_active[group] = 1U;
+        for (axis = 0U; axis < 2U; ++axis)
+        {
+            uint8_t index = group * 3U + axis;
+            long hz = rate[group * 2U + axis];
+            if (hz == 0)
+                Motor_Stop(index);
+            else
+                (void)Motor_StartContinuousHz(index, hz > 0 ? MOTOR_DIR_CW : MOTOR_DIR_CCW,
+                                              (uint32_t)(hz > 0 ? hz : -hz));
+        }
+    }
+    __set_PRIMASK(primask);
+    printf("OK DUAL %u%u\r\n", (unsigned)dual_active[0], (unsigned)dual_active[1]);
 }
 
 /*
@@ -1365,6 +1489,22 @@ static void Remote_Execute(char *line)
         return;
     }
 
+    if (strcmp(argv[0], "DUAL?") == 0)
+    {
+        if (UI_GroupEnabled(1U) && !ISOLATOR_STATIC_TEST &&
+            MOTOR_OUTPUT_ENABLED && motor_config_ready)
+            printf("OK DUAL V1\r\n");
+        else
+            printf("ERR DUAL UNAVAILABLE\r\n");
+        return;
+    }
+
+    if (strcmp(argv[0], "DUAL") == 0)
+    {
+        Remote_DualVelocity(argv, argc);
+        return;
+    }
+
     remote_last_cmd_ms = HAL_GetTick();
 
     if (strcmp(argv[0], "PING") == 0)
@@ -1412,6 +1552,9 @@ static void Remote_Execute(char *line)
 
     if (strcmp(argv[0], "LOCAL") == 0)
     {
+        Remote_DualRelease(0U);
+        Remote_DualRelease(1U);
+        dual_rearm[0] = dual_rearm[1] = 1U;
         remote_active = 0U;
         Motor_Stop(0U);
         Motor_Stop(1U);
@@ -1421,10 +1564,12 @@ static void Remote_Execute(char *line)
 
     if (strcmp(argv[0], "STOP") == 0)
     {
-        Motor_Stop(0U);
-        Motor_Stop(1U);
-        Motor_Stop(2U);
+        uint8_t motor_index;
+        for (motor_index = 0U; motor_index < MOTOR_COUNT; ++motor_index)
+            Motor_Stop(motor_index);
         remote_active = 0U;
+        dual_active[0] = dual_active[1] = 0U;
+        dual_rearm[0] = dual_rearm[1] = 1U;
         printf("OK STOP\r\n");
         return;
     }
@@ -1436,6 +1581,12 @@ static void Remote_Execute(char *line)
         return;
     }
     index = (uint8_t)(argv[0][1] - '1');
+
+    if (dual_active[0] || dual_active[1])
+    {
+        printf("ERR DUAL ACTIVE\r\n");
+        return;
+    }
 
     if (argc < 2U)
     {
@@ -1462,18 +1613,10 @@ static void Remote_Execute(char *line)
         {
             MotorDirection_t dir = (strcmp(argv[1], "CLAMP") == 0) ? MOTOR_DIR_CW : MOTOR_DIR_CCW;
 
-            if (Motor_StartFixedMove(dir) == 0U)
+            if (Motor_StartFixedMove(0U, dir) == 0U)
             {
                 printf("ERR M3 BUSY\r\n");
                 return;
-            }
-            if (dir == MOTOR_DIR_CW)
-            {
-                m3_clamp_count++;
-            }
-            else
-            {
-                m3_open_count++;
             }
             remote_active = 1U;
             printf("OK M3 %s %lu\r\n", (dir == MOTOR_DIR_CW) ? "CLAMP" : "OPEN",
@@ -1614,7 +1757,9 @@ static void Remote_Service(void)
         {
             *newline = '\0';
         }
-        Remote_Execute(line);
+        /* Never apply a partial DUAL rate frame (e.g. after cable loss). */
+        if (newline != NULL || (line[0] != 'D' && line[0] != 'd'))
+            Remote_Execute(line);
         if (newline == NULL)
         {
             break;

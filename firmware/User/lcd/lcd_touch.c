@@ -96,6 +96,7 @@ uint8_t LCD_Touch_Get_Points_Data(Touch_Point_t* p_data,int8_t* p_num)
                 {                  
                         p_data[i].x = (gt_reg_points[i].x_h & 0xF) << 8 | gt_reg_points[i].x_l;
                         p_data[i].y = (gt_reg_points[i].y_h & 0xF) << 8 | gt_reg_points[i].y_l;                 
+                        p_data[i].track_id = gt_reg_points[i].track_id & 0x0FU;
                 }                         
            } 
            

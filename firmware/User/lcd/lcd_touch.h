@@ -11,6 +11,7 @@ enum TouchIC
 typedef struct {
     uint16_t x;
     uint16_t y;
+    uint8_t track_id;
 } Touch_Point_t;
 
 
